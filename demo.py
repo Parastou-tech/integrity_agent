@@ -177,7 +177,7 @@ async def run_demo() -> None:
         print_report(r.json())
 
         divider()
-        print("\n  Demo complete. This report would be sent to the Instructor Co-pilot.\n")
+        print("\n  This report would be sent to the Instructor Co-pilot.\n")
 
 
 if __name__ == "__main__":
