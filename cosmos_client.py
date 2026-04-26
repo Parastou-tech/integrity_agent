@@ -107,6 +107,11 @@ class CosmosIntegrityClient:
         except cosmos_exceptions.CosmosResourceNotFoundError:
             return None
 
+    async def upsert_report(self, doc: dict) -> dict:
+        """Insert or replace a report document."""
+        result = await self._reports.upsert_item(body=doc)
+        return result
+
     async def get_reports_for_session(
         self, session_id: str, student_id: str
     ) -> list[dict]:

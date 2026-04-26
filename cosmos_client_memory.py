@@ -66,6 +66,10 @@ class MemoryIntegrityClient:
     async def get_report(self, report_id: str, student_id: str) -> Optional[dict]:
         return self._reports.get(report_id)
 
+    async def upsert_report(self, doc: dict) -> dict:
+        self._reports[doc["id"]] = doc
+        return doc
+
     async def get_reports_for_session(
         self, session_id: str, student_id: str
     ) -> list[dict]:

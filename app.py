@@ -24,6 +24,7 @@ from models import (
     EndSessionResponse,
     GenerateReportRequest,
     GenerateReportResponse,
+    PatchReportRequest,
     GuidanceLevel,
     PostLabCheckRequest,
     PostLabCheckResponse,
@@ -445,3 +446,20 @@ async def get_report(
     if report is None:
         raise HTTPException(status_code=404, detail="Report not found.")
     return report
+
+
+@app.patch(
+    "/report/{report_id}",
+    tags=["reports"],
+    dependencies=[Depends(verify_internal_token)],
+)
+async def patch_report(
+    report_id: str,
+    body: PatchReportRequest,
+    cosmos: CosmosIntegrityClient = Depends(get_cosmos),
+) -> dict:
+    report = await cosmos.get_report(report_id, body.student_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found.")
+    report["instructor_notes"] = body.instructor_notes
+    return await cosmos.upsert_report(report)
