@@ -96,3 +96,28 @@ def test_question_count_ceiling():
         assert responses[12]["question_count"] == 13
         assert responses[12]["student_message"] is not None
         assert "15" in responses[12]["student_message"]
+
+
+def test_validate_rate_limit():
+    # UUID-based student_id ensures this test never shares quota with others
+    student_id = f"rate-limit-{uuid.uuid4()}"
+
+    with TestClient(app) as c:
+        app.state.openai_client = _make_openai_mock("CONCEPTUAL", "FULL")
+
+        statuses = []
+        for _ in range(61):
+            r = c.post("/validate", json={
+                "student_id": student_id,
+                "session_id": "fake-session",
+                "lab_id": "lab01",
+                "course_id": "EE101",
+                "question_text": "test",
+                "conversation_history": [],
+            }, headers=HEADERS)
+            statuses.append(r.status_code)
+
+        # First 60 should not be rate limited (404 — session not found)
+        assert all(s != 429 for s in statuses[:60])
+        # 61st must be rate limited
+        assert statuses[60] == 429

@@ -7,6 +7,7 @@ Co-pilot when thresholds are exceeded, and generates end-of-session and
 post-lab integrity reports.
 """
 
+import json as _json
 import logging
 import uuid
 from contextlib import asynccontextmanager
@@ -14,8 +15,12 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from openai import AsyncAzureOpenAI, RateLimitError
 from pydantic_settings import BaseSettings
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from cosmos_client import CosmosIntegrityClient
 from cosmos_client_memory import MemoryIntegrityClient
@@ -74,6 +79,18 @@ logger = logging.getLogger(__name__)
 # Application lifespan
 # ---------------------------------------------------------------------------
 
+def _key_by_student_id(request: Request) -> str:
+    body = getattr(request.state, "_body", None)
+    if body:
+        try:
+            return _json.loads(body).get("student_id", "unknown")
+        except Exception:
+            pass
+    return "unknown"
+
+limiter = Limiter(key_func=_key_by_student_id)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if settings.USE_MEMORY_STORE:
@@ -108,6 +125,25 @@ app = FastAPI(
     description="Policy and integrity middleware for Cal Poly STEM lab AI tutoring.",
     lifespan=lifespan,
 )
+
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+
+@app.middleware("http")
+async def _cache_request_body(request: Request, call_next):
+    body = await request.body()
+    request.state._body = body
+    return await call_next(request)
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Rate limit exceeded. Please slow down and try again shortly."},
+    )
+
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -240,7 +276,9 @@ async def get_session(
     tags=["validation"],
     dependencies=[Depends(verify_internal_token)],
 )
+@limiter.limit("60/minute")
 async def validate_question(
+    request: Request,
     body: ValidateQuestionRequest,
     cosmos: CosmosIntegrityClient = Depends(get_cosmos),
     openai_client: AsyncAzureOpenAI = Depends(get_openai),
