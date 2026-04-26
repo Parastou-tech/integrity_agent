@@ -5,20 +5,19 @@ os.environ.setdefault("AZURE_OPENAI_DEPLOYMENT_NAME", "fake-deployment")
 os.environ.setdefault("USE_MEMORY_STORE", "true")
 os.environ.setdefault("INTERNAL_API_TOKEN", "demo-token")
 
+import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
 
-from app import app, get_openai
+from app import app
 
 HEADERS = {"X-Internal-Token": "demo-token", "Content-Type": "application/json"}
 BAD_HEADERS = {"X-Internal-Token": "wrong-token", "Content-Type": "application/json"}
 
 
 def _make_openai_mock():
-    from unittest.mock import MagicMock, AsyncMock
-    import json
     payload = json.dumps({
         "classification": "CONCEPTUAL",
         "confidence": 0.99,
@@ -52,85 +51,70 @@ def _start_session_and_get_report_id(c) -> tuple[str, str]:
 
 
 def test_patch_happy_path():
-    app.dependency_overrides[get_openai] = lambda: _make_openai_mock()
-    try:
-        with TestClient(app) as c:
-            student_id, report_id = _start_session_and_get_report_id(c)
+    with TestClient(app) as c:
+        app.state.openai_client = _make_openai_mock()
+        student_id, report_id = _start_session_and_get_report_id(c)
 
-            r = c.patch(f"/report/{report_id}", json={
-                "student_id": student_id,
-                "instructor_notes": {"flagged": True, "note": "test note"},
-            }, headers=HEADERS)
-            assert r.status_code == 200
-            assert r.json()["instructor_notes"] == {"flagged": True, "note": "test note"}
+        r = c.patch(f"/report/{report_id}", json={
+            "student_id": student_id,
+            "instructor_notes": {"flagged": True, "note": "test note"},
+        }, headers=HEADERS)
+        assert r.status_code == 200
+        assert r.json()["instructor_notes"] == {"flagged": True, "note": "test note"}
 
-            r = c.get(f"/report/{report_id}", params={"student_id": student_id}, headers=HEADERS)
-            assert r.json()["instructor_notes"] == {"flagged": True, "note": "test note"}
-    finally:
-        app.dependency_overrides.clear()
+        r = c.get(f"/report/{report_id}", params={"student_id": student_id}, headers=HEADERS)
+        assert r.json()["instructor_notes"] == {"flagged": True, "note": "test note"}
 
 
 def test_patch_overwrites_existing_notes():
-    app.dependency_overrides[get_openai] = lambda: _make_openai_mock()
-    try:
-        with TestClient(app) as c:
-            student_id, report_id = _start_session_and_get_report_id(c)
+    with TestClient(app) as c:
+        app.state.openai_client = _make_openai_mock()
+        student_id, report_id = _start_session_and_get_report_id(c)
 
-            c.patch(f"/report/{report_id}", json={
-                "student_id": student_id,
-                "instructor_notes": {"flagged": True, "note": "first"},
-            }, headers=HEADERS)
+        c.patch(f"/report/{report_id}", json={
+            "student_id": student_id,
+            "instructor_notes": {"flagged": True, "note": "first"},
+        }, headers=HEADERS)
 
-            r = c.patch(f"/report/{report_id}", json={
-                "student_id": student_id,
-                "instructor_notes": {"flagged": False, "note": "overwritten"},
-            }, headers=HEADERS)
-            assert r.status_code == 200
+        r = c.patch(f"/report/{report_id}", json={
+            "student_id": student_id,
+            "instructor_notes": {"flagged": False, "note": "overwritten"},
+        }, headers=HEADERS)
+        assert r.status_code == 200
 
-            r = c.get(f"/report/{report_id}", params={"student_id": student_id}, headers=HEADERS)
-            assert r.json()["instructor_notes"] == {"flagged": False, "note": "overwritten"}
-    finally:
-        app.dependency_overrides.clear()
+        r = c.get(f"/report/{report_id}", params={"student_id": student_id}, headers=HEADERS)
+        assert r.json()["instructor_notes"] == {"flagged": False, "note": "overwritten"}
 
 
 def test_patch_wrong_student_id_returns_404():
-    app.dependency_overrides[get_openai] = lambda: _make_openai_mock()
-    try:
-        with TestClient(app) as c:
-            student_id, report_id = _start_session_and_get_report_id(c)
+    with TestClient(app) as c:
+        app.state.openai_client = _make_openai_mock()
+        student_id, report_id = _start_session_and_get_report_id(c)
 
-            r = c.patch(f"/report/{report_id}", json={
-                "student_id": "different-student",
-                "instructor_notes": {"flagged": True},
-            }, headers=HEADERS)
-            assert r.status_code == 404
-    finally:
-        app.dependency_overrides.clear()
+        r = c.patch(f"/report/{report_id}", json={
+            "student_id": "different-student",
+            "instructor_notes": {"flagged": True},
+        }, headers=HEADERS)
+        assert r.status_code == 404
 
 
 def test_patch_nonexistent_report_returns_404():
-    app.dependency_overrides[get_openai] = lambda: _make_openai_mock()
-    try:
-        with TestClient(app) as c:
-            r = c.patch("/report/nonexistent-id", json={
-                "student_id": "test",
-                "instructor_notes": {"flagged": True},
-            }, headers=HEADERS)
-            assert r.status_code == 404
-    finally:
-        app.dependency_overrides.clear()
+    with TestClient(app) as c:
+        app.state.openai_client = _make_openai_mock()
+        r = c.patch("/report/nonexistent-id", json={
+            "student_id": "test",
+            "instructor_notes": {"flagged": True},
+        }, headers=HEADERS)
+        assert r.status_code == 404
 
 
 def test_patch_bad_token_returns_403():
-    app.dependency_overrides[get_openai] = lambda: _make_openai_mock()
-    try:
-        with TestClient(app) as c:
-            student_id, report_id = _start_session_and_get_report_id(c)
+    with TestClient(app) as c:
+        app.state.openai_client = _make_openai_mock()
+        student_id, report_id = _start_session_and_get_report_id(c)
 
-            r = c.patch(f"/report/{report_id}", json={
-                "student_id": student_id,
-                "instructor_notes": {"flagged": True},
-            }, headers=BAD_HEADERS)
-            assert r.status_code == 403
-    finally:
-        app.dependency_overrides.clear()
+        r = c.patch(f"/report/{report_id}", json={
+            "student_id": student_id,
+            "instructor_notes": {"flagged": True},
+        }, headers=BAD_HEADERS)
+        assert r.status_code == 403
