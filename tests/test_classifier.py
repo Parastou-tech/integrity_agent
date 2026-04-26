@@ -1,7 +1,8 @@
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+from openai import RateLimitError
 
 from models import GuidanceLevel, QuestionClassification
 from policy_engine import ClassificationResult, classify_question
@@ -113,3 +114,71 @@ async def test_malformed_json_raises():
             openai_client=client,
             deployment_name="fake-deployment",
         )
+
+
+# ---------------------------------------------------------------------------
+# RateLimitError and generic exception propagation
+# ---------------------------------------------------------------------------
+
+async def test_rate_limit_error_propagates():
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(
+        side_effect=RateLimitError(
+            message="rate limit exceeded",
+            response=MagicMock(status_code=429, headers={}),
+            body={},
+        )
+    )
+    with pytest.raises(RateLimitError):
+        await classify_question(
+            question_text="test",
+            conversation_history=[],
+            session_context=SESSION_CONTEXT,
+            openai_client=client,
+            deployment_name="fake-deployment",
+        )
+
+
+async def test_generic_exception_propagates():
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(side_effect=ConnectionError("network failure"))
+    with pytest.raises(ConnectionError):
+        await classify_question(
+            question_text="test",
+            conversation_history=[],
+            session_context=SESSION_CONTEXT,
+            openai_client=client,
+            deployment_name="fake-deployment",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Conversation history trimming — only last 6 turns sent to OpenAI
+# ---------------------------------------------------------------------------
+
+async def test_conversation_history_trimmed_to_last_6_turns():
+    client = _make_openai_mock("CONCEPTUAL", "FULL")
+
+    history = [
+        {"role": "user",      "content": f"question {i}"}
+        for i in range(10)  # 10 turns, only last 6 should be sent
+    ]
+
+    await classify_question(
+        question_text="test",
+        conversation_history=history,
+        session_context=SESSION_CONTEXT,
+        openai_client=client,
+        deployment_name="fake-deployment",
+    )
+
+    # Extract the user message content that was sent to OpenAI
+    sent_content = client.chat.completions.create.call_args[1]["messages"][1]["content"]
+
+    # Last 6 turns are "question 4" through "question 9"
+    for i in range(4, 10):
+        assert f"question {i}" in sent_content
+
+    # First 4 turns should have been trimmed
+    for i in range(0, 4):
+        assert f"question {i}" not in sent_content
