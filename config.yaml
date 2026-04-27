@@ -26,15 +26,15 @@ properties:
       name: integrity-guardian-app
       env:
       - name: AZURE_OPENAI_ENDPOINT
-        value: <AZURE_OPENAI_ENDPOINT>
+        value: https://aieic-participant-openai.openai.azure.com/
       - name: AZURE_OPENAI_DEPLOYMENT_NAME
-        value: <AZURE_OPENAI_DEPLOYMENT_NAME>
+        value: gpt-4o
       - name: AZURE_OPENAI_API_VERSION
-        value: "2024-12-01-preview"
+        value: "2024-02-01"
       - name: AZURE_OPENAI_API_KEY
         secretRef: aoai-key
       - name: COSMOS_URL
-        value: <COSMOS_URL>
+        value: https://aieic-cosmos-ytan2026.documents.azure.com:443/
       - name: COSMOS_KEY
         secretRef: cosmos-key
       - name: COSMOS_DATABASE
