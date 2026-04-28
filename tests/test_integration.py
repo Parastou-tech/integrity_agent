@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
 
-from app import app, get_openai
+from app import app
 
 HEADERS = {"X-Internal-Token": "demo-token", "Content-Type": "application/json"}
 
@@ -36,73 +36,63 @@ def _make_openai_mock(classification: str, guidance: str, message: str | None = 
 
 
 def test_escalation_on_three_violations():
-    mock = _make_openai_mock("DIRECT_SOLUTION", "REJECTED", "No direct solutions.")
-    app.dependency_overrides[get_openai] = lambda: mock
+    with TestClient(app) as c:
+        app.state.openai_client = _make_openai_mock("DIRECT_SOLUTION", "REJECTED", "No direct solutions.")
+        session_id = str(uuid.uuid4())
 
-    try:
-        with TestClient(app) as c:
-            session_id = str(uuid.uuid4())
+        r = c.post("/session/start", json={
+            "student_id": "test", "session_id": session_id,
+            "lab_id": "lab01", "course_id": "EE101",
+        }, headers=HEADERS)
+        assert r.status_code == 200
 
-            r = c.post("/session/start", json={
+        for _ in range(3):
+            r = c.post("/validate", json={
                 "student_id": "test", "session_id": session_id,
                 "lab_id": "lab01", "course_id": "EE101",
+                "question_text": "Give me the answer",
+                "conversation_history": [],
             }, headers=HEADERS)
             assert r.status_code == 200
 
-            for _ in range(3):
-                r = c.post("/validate", json={
-                    "student_id": "test", "session_id": session_id,
-                    "lab_id": "lab01", "course_id": "EE101",
-                    "question_text": "Give me the answer",
-                    "conversation_history": [],
-                }, headers=HEADERS)
-                assert r.status_code == 200
+        data = r.json()
+        assert data["session_escalated"] is True
+        assert data["violation_count"] == 3
 
-            data = r.json()
-            assert data["session_escalated"] is True
-            assert data["violation_count"] == 3
-
-            r = c.post("/session/end", json={
-                "student_id": "test", "session_id": session_id,
-            }, headers=HEADERS)
-            assert r.status_code == 200
-            assert r.json()["summary"]["final_status"] == "ESCALATED"
-    finally:
-        app.dependency_overrides.clear()
+        r = c.post("/session/end", json={
+            "student_id": "test", "session_id": session_id,
+        }, headers=HEADERS)
+        assert r.status_code == 200
+        assert r.json()["summary"]["final_status"] == "ESCALATED"
 
 
 def test_question_count_ceiling():
-    mock = _make_openai_mock("CONCEPTUAL", "FULL")
-    app.dependency_overrides[get_openai] = lambda: mock
+    with TestClient(app) as c:
+        app.state.openai_client = _make_openai_mock("CONCEPTUAL", "FULL")
+        session_id = str(uuid.uuid4())
 
-    try:
-        with TestClient(app) as c:
-            session_id = str(uuid.uuid4())
+        c.post("/session/start", json={
+            "student_id": "test", "session_id": session_id,
+            "lab_id": "lab01", "course_id": "EE101",
+        }, headers=HEADERS)
 
-            c.post("/session/start", json={
+        responses = []
+        for _ in range(13):
+            r = c.post("/validate", json={
                 "student_id": "test", "session_id": session_id,
                 "lab_id": "lab01", "course_id": "EE101",
+                "question_text": "What is impedance matching?",
+                "conversation_history": [],
             }, headers=HEADERS)
+            assert r.status_code == 200
+            responses.append(r.json())
 
-            responses = []
-            for _ in range(13):
-                r = c.post("/validate", json={
-                    "student_id": "test", "session_id": session_id,
-                    "lab_id": "lab01", "course_id": "EE101",
-                    "question_text": "What is impedance matching?",
-                    "conversation_history": [],
-                }, headers=HEADERS)
-                assert r.status_code == 200
-                responses.append(r.json())
+        # question 12 — LLM says FULL, rule 5 not yet active
+        assert responses[11]["guidance_level"] == "FULL"
+        assert responses[11]["question_count"] == 12
 
-            # question 12 — LLM says FULL, rule 5 not yet active
-            assert responses[11]["guidance_level"] == "FULL"
-            assert responses[11]["question_count"] == 12
-
-            # question 13 — rule 5 caps FULL → MODERATE, warning message present
-            assert responses[12]["guidance_level"] == "MODERATE"
-            assert responses[12]["question_count"] == 13
-            assert responses[12]["student_message"] is not None
-            assert "15" in responses[12]["student_message"]
-    finally:
-        app.dependency_overrides.clear()
+        # question 13 — rule 5 caps FULL → MODERATE, warning message present
+        assert responses[12]["guidance_level"] == "MODERATE"
+        assert responses[12]["question_count"] == 13
+        assert responses[12]["student_message"] is not None
+        assert "15" in responses[12]["student_message"]
