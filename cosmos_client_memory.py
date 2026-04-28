@@ -37,7 +37,10 @@ class MemoryIntegrityClient:
         return doc
 
     async def get_session(self, session_id: str, student_id: str) -> Optional[dict]:
-        return self._sessions.get(session_id)
+        session = self._sessions.get(session_id)
+        if session is None or session.get("student_id") != student_id:
+            return None
+        return session
 
     async def upsert_session(self, doc: dict) -> dict:
         self._sessions[doc["id"]] = doc
@@ -64,7 +67,14 @@ class MemoryIntegrityClient:
         return doc
 
     async def get_report(self, report_id: str, student_id: str) -> Optional[dict]:
-        return self._reports.get(report_id)
+        report = self._reports.get(report_id)
+        if report is None or report.get("student_id") != student_id:
+            return None
+        return report
+
+    async def upsert_report(self, doc: dict) -> dict:
+        self._reports[doc["id"]] = doc
+        return doc
 
     async def get_reports_for_session(
         self, session_id: str, student_id: str

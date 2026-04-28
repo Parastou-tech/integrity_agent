@@ -116,6 +116,11 @@ class GenerateReportResponse(BaseModel):
     report: dict
 
 
+class PatchReportRequest(BaseModel):
+    student_id: str
+    instructor_notes: dict
+
+
 class PostLabCheckRequest(BaseModel):
     student_id: str
     session_ids: list[str]
