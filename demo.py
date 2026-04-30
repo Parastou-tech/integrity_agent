@@ -3,11 +3,11 @@ Integrity Guardian — Demo Script
 
 Walks through the complete flow against a locally running server:
   1. Start a session
-  2. Ask an appropriate conceptual question      → FULL guidance
-  3. Ask a procedural question                   → MODERATE guidance
-  4. Ask for a direct solution (violation #1)    → REJECTED
-  5. Ask for a direct solution again (violation #2) → REJECTED
-  6. Ask for a direct solution a third time (violation #3) → REJECTED + ESCALATION
+  2. Ask an appropriate conceptual question      → CONCEPTUAL, no violation
+  3. Ask a procedural question                   → PROCEDURAL, no violation
+  4. Ask for a direct solution (violation #1)    → DIRECT_SOLUTION, logged
+  5. Ask for a direct solution again (violation #2) → DIRECT_SOLUTION, logged
+  6. Ask for a direct solution a third time (violation #3) → ESCALATION
   7. End the session and print the integrity report
 
 Run the server first:
@@ -80,25 +80,24 @@ def divider(title: str = "") -> None:
 
 
 def print_validation(q_label: str, response: dict) -> None:
-    approved = response["approved"]
-    level = response["guidance_level"]
     classification = response["classification"]
+    violation = response["violation_detected"]
+    violation_type = response.get("violation_type")
     violations = response["violation_count"]
     questions = response["question_count"]
     escalated = response["session_escalated"]
+    concept_tags = response.get("concept_tags", [])
 
-    status = "APPROVED" if approved else "REJECTED"
-    icon = "✅" if approved else "❌"
-
-    print(f"\n  {icon} Status:         {status}")
-    print(f"     Classification: {classification}")
-    print(f"     Guidance level: {level}")
-    print(f"     Questions used: {questions}/15")
-    print(f"     Violations:     {violations}/3")
+    icon = "🚨" if violation else "✅"
+    print(f"\n  {icon} Classification: {classification}")
+    if violation_type:
+        print(f"     Violation:      {violation_type}")
+    if concept_tags:
+        print(f"     Concept tags:   {', '.join(concept_tags)}")
+    print(f"     Questions so far: {questions}")
+    print(f"     Violations so far: {violations}/3")
     if escalated:
         print("     🚨 SESSION ESCALATED — instructor notified")
-    if response.get("student_message"):
-        print(f"\n  Message to student:\n    \"{response['student_message']}\"")
 
 
 def print_report(report: dict) -> None:
@@ -107,10 +106,16 @@ def print_report(report: dict) -> None:
     print(f"  Total questions: {summary.get('total_questions')}")
     print(f"  Violations:      {summary.get('violation_count')}")
     print(f"  Escalated:       {summary.get('escalated')}")
-    print(f"\n  Guidance distribution:")
-    for level, count in summary.get("guidance_distribution", {}).items():
+    print(f"\n  Classification breakdown:")
+    for cls, count in summary.get("classification_distribution", {}).items():
         if count > 0:
-            print(f"    {level:10s}: {count}")
+            print(f"    {cls:20s}: {count}")
+
+    concept_struggles = summary.get("concept_struggle_summary", [])
+    if concept_struggles:
+        print(f"\n  Concepts flagged in violations:")
+        for c in concept_struggles:
+            print(f"    {c['concept']} ({', '.join(c['violation_types'])})")
 
     violations = report.get("violations_detail", [])
     if violations:
