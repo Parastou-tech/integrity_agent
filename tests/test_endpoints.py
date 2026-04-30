@@ -22,8 +22,7 @@ def _make_openai_mock():
         "classification": "CONCEPTUAL",
         "confidence": 0.99,
         "reasoning": "mocked",
-        "recommended_guidance": "FULL",
-        "student_facing_message": None,
+        "concept_tags": [],
     })
     mock_msg = MagicMock()
     mock_msg.content = payload
@@ -209,3 +208,78 @@ def test_start_session_cosmos_error_returns_503():
             "lab_id": "lab01", "course_id": "EE101",
         }, headers=HEADERS)
         assert r.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# GET /analytics/lab/{lab_id}
+# ---------------------------------------------------------------------------
+
+def test_lab_analytics_empty_lab():
+    with TestClient(app) as c:
+        r = c.get("/analytics/lab/lab-no-sessions", headers=HEADERS)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["lab_id"] == "lab-no-sessions"
+        assert data["session_stats"]["total_sessions"] == 0
+        assert data["question_stats"]["total_questions"] == 0
+        assert data["per_student"] == []
+        assert data["concept_struggle_summary"] == []
+
+
+def test_lab_analytics_with_sessions():
+    with TestClient(app) as c:
+        app.state.openai_client = _make_openai_mock()
+        lab_id = f"lab-analytics-{uuid.uuid4()}"
+
+        # Start two sessions for different students, same lab
+        for student in ["alice", "bob"]:
+            sid = str(uuid.uuid4())
+            c.post("/session/start", json={
+                "student_id": student, "session_id": sid,
+                "lab_id": lab_id, "course_id": "EE101",
+            }, headers=HEADERS)
+            c.post("/session/end", json={
+                "student_id": student, "session_id": sid,
+            }, headers=HEADERS)
+
+        r = c.get(f"/analytics/lab/{lab_id}", headers=HEADERS)
+        assert r.status_code == 200
+        data = r.json()
+
+        assert data["lab_id"] == lab_id
+        assert data["session_stats"]["total_sessions"] == 2
+        assert data["session_stats"]["closed_sessions"] == 2
+        assert "total_questions" in data["question_stats"]
+        assert "direct_solution_attempts" in data["question_stats"]
+        assert "CONCEPTUAL" in data["classification_distribution"]
+        assert len(data["per_student"]) == 2
+        statuses = {p["student_id"]: p["status"] for p in data["per_student"]}
+        assert "alice" in statuses
+        assert "bob" in statuses
+
+
+def test_lab_analytics_course_id_filter():
+    with TestClient(app) as c:
+        app.state.openai_client = _make_openai_mock()
+        lab_id = f"lab-filter-{uuid.uuid4()}"
+
+        # Two sessions — different course IDs
+        for course in ["EE101", "EE202"]:
+            sid = str(uuid.uuid4())
+            c.post("/session/start", json={
+                "student_id": f"student-{course}", "session_id": sid,
+                "lab_id": lab_id, "course_id": course,
+            }, headers=HEADERS)
+
+        # Filter to EE101 only
+        r = c.get(f"/analytics/lab/{lab_id}", params={"course_id": "EE101"}, headers=HEADERS)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["session_stats"]["total_sessions"] == 1
+        assert data["per_student"][0]["student_id"] == "student-EE101"
+
+
+def test_lab_analytics_requires_auth():
+    with TestClient(app) as c:
+        r = c.get("/analytics/lab/lab01", headers={"X-Internal-Token": "wrong"})
+        assert r.status_code == 403

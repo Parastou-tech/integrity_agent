@@ -22,8 +22,7 @@ def _make_openai_mock():
         "classification": "CONCEPTUAL",
         "confidence": 0.99,
         "reasoning": "mocked",
-        "recommended_guidance": "FULL",
-        "student_facing_message": None,
+        "concept_tags": [],
     })
     mock_msg = MagicMock()
     mock_msg.content = payload

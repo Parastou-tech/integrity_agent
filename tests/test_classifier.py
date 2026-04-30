@@ -1,22 +1,24 @@
 import json
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from openai import RateLimitError
 
-from models import GuidanceLevel, QuestionClassification
+from models import QuestionClassification
 from policy_engine import ClassificationResult, classify_question
 
 SESSION_CONTEXT = {"lab_id": "lab01", "question_count": 3, "violation_count": 0}
 
 
-def _make_openai_mock(classification: str, guidance: str, message: str | None = None) -> MagicMock:
+def _make_openai_mock(
+    classification: str,
+    concept_tags: list[str] | None = None,
+) -> MagicMock:
     payload = json.dumps({
         "classification": classification,
         "confidence": 0.99,
         "reasoning": "mocked",
-        "recommended_guidance": guidance,
-        "student_facing_message": message,
+        "concept_tags": concept_tags if concept_tags is not None else [],
     })
     mock_msg = MagicMock()
     mock_msg.content = payload
@@ -45,15 +47,15 @@ def _make_malformed_mock(raw: str) -> MagicMock:
 # All 5 classification types
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("classification,guidance", [
-    ("CONCEPTUAL",      "FULL"),
-    ("PROCEDURAL",      "MODERATE"),
-    ("CLARIFICATION",   "FULL"),
-    ("DIRECT_SOLUTION", "REJECTED"),
-    ("ANSWER_FARMING",  "MINIMAL"),
+@pytest.mark.parametrize("classification", [
+    "CONCEPTUAL",
+    "PROCEDURAL",
+    "CLARIFICATION",
+    "DIRECT_SOLUTION",
+    "ANSWER_FARMING",
 ])
-async def test_classify_all_types(classification, guidance):
-    client = _make_openai_mock(classification, guidance)
+async def test_classify_all_types(classification):
+    client = _make_openai_mock(classification)
     result = await classify_question(
         question_text="test question",
         conversation_history=[],
@@ -62,46 +64,29 @@ async def test_classify_all_types(classification, guidance):
         deployment_name="fake-deployment",
     )
     assert result.classification == QuestionClassification(classification)
-    assert result.recommended_guidance == GuidanceLevel(guidance)
     assert result.confidence == 0.99
     assert result.reasoning == "mocked"
+    assert result.concept_tags == []
 
 
 # ---------------------------------------------------------------------------
-# student_facing_message present vs null
+# concept_tags
 # ---------------------------------------------------------------------------
 
-async def test_student_facing_message_present():
-    client = _make_openai_mock("DIRECT_SOLUTION", "REJECTED", "No direct solutions.")
+async def test_concept_tags_extracted_by_classifier():
+    client = _make_openai_mock("PROCEDURAL", concept_tags=["op-amp gain"])
     result = await classify_question(
-        question_text="Give me the answer",
+        question_text="How do I find op-amp gain?",
         conversation_history=[],
         session_context=SESSION_CONTEXT,
         openai_client=client,
         deployment_name="fake-deployment",
     )
-    assert result.student_facing_message == "No direct solutions."
-
-
-async def test_student_facing_message_null():
-    client = _make_openai_mock("CONCEPTUAL", "FULL", message=None)
-    result = await classify_question(
-        question_text="What is impedance matching?",
-        conversation_history=[],
-        session_context=SESSION_CONTEXT,
-        openai_client=client,
-        deployment_name="fake-deployment",
-    )
-    assert result.student_facing_message is None
+    assert result.concept_tags == ["op-amp gain"]
 
 
 # ---------------------------------------------------------------------------
 # Malformed JSON response
-#
-# classify_question() calls json.loads() with no try/except — a malformed
-# response raises json.JSONDecodeError. This is intentional: app.py's
-# /validate endpoint wraps classify_question() in a broad except clause
-# that applies a MODERATE fail-safe, so the error is handled upstream.
 # ---------------------------------------------------------------------------
 
 async def test_malformed_json_raises():
@@ -157,10 +142,10 @@ async def test_generic_exception_propagates():
 # ---------------------------------------------------------------------------
 
 async def test_conversation_history_trimmed_to_last_6_turns():
-    client = _make_openai_mock("CONCEPTUAL", "FULL")
+    client = _make_openai_mock("CONCEPTUAL")
 
     history = [
-        {"role": "user",      "content": f"question {i}"}
+        {"role": "user", "content": f"question {i}"}
         for i in range(10)  # 10 turns, only last 6 should be sent
     ]
 
@@ -172,7 +157,6 @@ async def test_conversation_history_trimmed_to_last_6_turns():
         deployment_name="fake-deployment",
     )
 
-    # Extract the user message content that was sent to OpenAI
     sent_content = client.chat.completions.create.call_args[1]["messages"][1]["content"]
 
     # Last 6 turns are "question 4" through "question 9"

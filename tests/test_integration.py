@@ -16,13 +16,12 @@ from app import app
 HEADERS = {"X-Internal-Token": "demo-token", "Content-Type": "application/json"}
 
 
-def _make_openai_mock(classification: str, guidance: str, message: str | None = None):
+def _make_openai_mock(classification: str, concept_tags: list[str] | None = None):
     payload = json.dumps({
         "classification": classification,
         "confidence": 0.99,
         "reasoning": "mocked",
-        "recommended_guidance": guidance,
-        "student_facing_message": message,
+        "concept_tags": concept_tags or [],
     })
     mock_msg = MagicMock()
     mock_msg.content = payload
@@ -37,7 +36,9 @@ def _make_openai_mock(classification: str, guidance: str, message: str | None = 
 
 def test_escalation_on_three_violations():
     with TestClient(app) as c:
-        app.state.openai_client = _make_openai_mock("DIRECT_SOLUTION", "REJECTED", "No direct solutions.")
+        app.state.openai_client = _make_openai_mock(
+            "DIRECT_SOLUTION", concept_tags=["circuit analysis"]
+        )
         session_id = str(uuid.uuid4())
 
         r = c.post("/session/start", json={
@@ -56,8 +57,15 @@ def test_escalation_on_three_violations():
             assert r.status_code == 200
 
         data = r.json()
+        # Observational fields still present
         assert data["session_escalated"] is True
         assert data["violation_count"] == 3
+        assert data["classification"] == "DIRECT_SOLUTION"
+        assert data["violation_detected"] is True
+        # No enforcement fields
+        assert "approved" not in data
+        assert "guidance_level" not in data
+        assert "student_message" not in data
 
         r = c.post("/session/end", json={
             "student_id": "test", "session_id": session_id,
@@ -66,9 +74,12 @@ def test_escalation_on_three_violations():
         assert r.json()["summary"]["final_status"] == "ESCALATED"
 
 
-def test_question_count_ceiling():
+def test_validate_response_shape_for_clean_question():
+    """Non-violation question returns expected observational fields only."""
     with TestClient(app) as c:
-        app.state.openai_client = _make_openai_mock("CONCEPTUAL", "FULL")
+        app.state.openai_client = _make_openai_mock(
+            "CONCEPTUAL", concept_tags=["Thevenin equivalent"]
+        )
         session_id = str(uuid.uuid4())
 
         c.post("/session/start", json={
@@ -76,26 +87,23 @@ def test_question_count_ceiling():
             "lab_id": "lab01", "course_id": "EE101",
         }, headers=HEADERS)
 
-        responses = []
-        for _ in range(13):
-            r = c.post("/validate", json={
-                "student_id": "test", "session_id": session_id,
-                "lab_id": "lab01", "course_id": "EE101",
-                "question_text": "What is impedance matching?",
-                "conversation_history": [],
-            }, headers=HEADERS)
-            assert r.status_code == 200
-            responses.append(r.json())
+        r = c.post("/validate", json={
+            "student_id": "test", "session_id": session_id,
+            "lab_id": "lab01", "course_id": "EE101",
+            "question_text": "What is Thevenin equivalent?",
+            "conversation_history": [],
+        }, headers=HEADERS)
+        assert r.status_code == 200
+        data = r.json()
 
-        # question 12 — LLM says FULL, rule 5 not yet active
-        assert responses[11]["guidance_level"] == "FULL"
-        assert responses[11]["question_count"] == 12
-
-        # question 13 — rule 5 caps FULL → MODERATE, warning message present
-        assert responses[12]["guidance_level"] == "MODERATE"
-        assert responses[12]["question_count"] == 13
-        assert responses[12]["student_message"] is not None
-        assert "15" in responses[12]["student_message"]
+        assert data["classification"] == "CONCEPTUAL"
+        assert data["violation_detected"] is False
+        assert data["violation_type"] is None
+        assert data["session_escalated"] is False
+        assert data["question_count"] == 1
+        assert "approved" not in data
+        assert "guidance_level" not in data
+        assert "student_message" not in data
 
 
 def test_validate_rate_limit():
@@ -103,7 +111,7 @@ def test_validate_rate_limit():
     student_id = f"rate-limit-{uuid.uuid4()}"
 
     with TestClient(app) as c:
-        app.state.openai_client = _make_openai_mock("CONCEPTUAL", "FULL")
+        app.state.openai_client = _make_openai_mock("CONCEPTUAL")
 
         statuses = []
         for _ in range(61):
