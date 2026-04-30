@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from models import FinalStatus, GuidanceLevel, ReportType
+from models import FinalStatus, QuestionClassification, ReportType
 
 if TYPE_CHECKING:
     from cosmos_client import CosmosIntegrityClient
@@ -38,17 +38,36 @@ async def generate_session_report(
     violation_count = session_doc.get("violation_count", len(violations))
     escalated = session_doc.get("escalated", False)
 
-    # guidance distribution
-    distribution = {level.value: 0 for level in GuidanceLevel}
+    # classification distribution
+    classification_distribution = {c.value: 0 for c in QuestionClassification}
     for q in questions:
-        level = q.get("guidance_level", GuidanceLevel.FULL.value)
-        if level in distribution:
-            distribution[level] += 1
+        cls = q.get("classification")
+        if cls in classification_distribution:
+            classification_distribution[cls] += 1
+
+    # concept struggle summary — concepts from violation questions
+    concept_violation_counts: dict[str, list[str]] = {}
+    for q in questions:
+        if q.get("violation"):
+            for tag in q.get("concept_tags", []):
+                if tag not in concept_violation_counts:
+                    concept_violation_counts[tag] = []
+                concept_violation_counts[tag].append(
+                    q.get("violation_type", "UNKNOWN")
+                )
+    concept_struggle_summary = [
+        {
+            "concept": concept,
+            "count": len(vtypes),
+            "violation_types": list(set(vtypes)),
+        }
+        for concept, vtypes in concept_violation_counts.items()
+    ]
 
     # final status
     if escalated:
         final_status = FinalStatus.ESCALATED.value
-    elif violation_count > 0 or session_doc.get("warning_issued", False):
+    elif violation_count > 0:
         final_status = FinalStatus.WARNING.value
     else:
         final_status = FinalStatus.CLEAN.value
@@ -57,7 +76,6 @@ async def generate_session_report(
     escalation_ts = None
     escalation_reason = None
     if escalated and violations:
-        # timestamp of the 3rd violation
         third = violations[2] if len(violations) >= 3 else violations[-1]
         escalation_ts = third.get("timestamp")
         escalation_reason = (
@@ -80,8 +98,8 @@ async def generate_session_report(
             "violation_count": violation_count,
             "escalated": escalated,
             "final_status": final_status,
-            "guidance_distribution": distribution,
-            "question_frequency_warning_triggered": session_doc.get("warning_issued", False),
+            "classification_distribution": classification_distribution,
+            "concept_struggle_summary": concept_struggle_summary,
         },
         "violations_detail": violations,
         "escalation_log": {
@@ -134,16 +152,14 @@ async def generate_post_lab_report(
             any_escalated = True
 
     total_q = len(all_questions)
-    total_rejections = sum(
-        1 for q in all_questions if q.get("guidance_level") == GuidanceLevel.REJECTED.value
-    )
-    total_full = sum(
-        1 for q in all_questions if q.get("guidance_level") == GuidanceLevel.FULL.value
-    )
 
-    # Indicator: high rejection ratio
-    high_rejection_ratio = (
-        (total_rejections / total_q) > 0.2 if total_q > 0 else False
+    # Indicator: high direct-solution attempt ratio
+    total_direct_solution = sum(
+        1 for q in all_questions
+        if q.get("classification") == QuestionClassification.DIRECT_SOLUTION.value
+    )
+    high_direct_solution_ratio = (
+        (total_direct_solution / total_q) > 0.2 if total_q > 0 else False
     )
 
     # Indicator: rapid successive questions (< 30 s apart)
@@ -158,20 +174,33 @@ async def generate_post_lab_report(
         vt: count for vt, count in violation_type_counts.items() if count >= 3
     }
 
-    # Indicator: low FULL guidance ratio
-    low_full_ratio = (total_full / total_q) < 0.5 if total_q > 0 else False
+    # Indicator: concept struggle areas — concepts that appeared in violation questions
+    violation_concept_counts: dict[str, int] = {}
+    for q in all_questions:
+        if q.get("violation"):
+            for tag in q.get("concept_tags", []):
+                violation_concept_counts[tag] = violation_concept_counts.get(tag, 0) + 1
+    concept_struggle_areas = [
+        {"concept": c, "count": n}
+        for c, n in sorted(violation_concept_counts.items(), key=lambda x: -x[1])
+    ]
 
     indicators = {
-        "high_rejection_ratio": high_rejection_ratio,
+        "high_direct_solution_ratio": high_direct_solution_ratio,
         "rapid_successive_questions": rapid_successive,
         "escalated_any_session": any_escalated,
         "repeated_violation_types": repeated_violation_types,
-        "low_full_guidance_ratio": low_full_ratio,
+        "concept_struggle_areas": concept_struggle_areas,
     }
 
-    flagged_count = sum(
-        1 for v in indicators.values() if (v is True or (isinstance(v, dict) and v))
-    )
+    flagged_count = sum([
+        1 if high_direct_solution_ratio else 0,
+        1 if rapid_successive else 0,
+        1 if any_escalated else 0,
+        1 if repeated_violation_types else 0,
+        1 if concept_struggle_areas else 0,
+    ])
+
     if flagged_count == 0:
         summary = "No over-reliance indicators detected."
     elif flagged_count == 1:
@@ -195,7 +224,6 @@ async def generate_post_lab_report(
         "stats": {
             "total_questions": total_q,
             "total_violations": len(all_violations),
-            "total_rejections": total_rejections,
             "sessions_analysed": len(session_docs),
         },
         "over_reliance_indicators": indicators,
@@ -227,7 +255,6 @@ def _check_rapid_successive(questions: list[dict]) -> bool:
         ts_str = q.get("timestamp")
         if ts_str:
             try:
-                # Handle both "Z" suffix and offset-aware ISO strings
                 ts_str_clean = ts_str.replace("Z", "+00:00")
                 ts = datetime.fromisoformat(ts_str_clean)
                 if ts.tzinfo is None:

@@ -1,10 +1,10 @@
 """
 AIEIC Integrity Guardian — FastAPI Service
 
-Validates student questions for academic integrity compliance before the Lab
-Companion responds. Tracks violations per session, escalates to the Instructor
-Co-pilot when thresholds are exceeded, and generates end-of-session and
-post-lab integrity reports.
+Classifies and logs student questions for academic integrity analysis.
+Tracks violation patterns per session, escalates to the Instructor Co-pilot
+when thresholds are exceeded, and generates end-of-session and post-lab
+integrity reports. Does NOT block or constrain Lab Companion responses.
 """
 
 import json as _json
@@ -29,21 +29,24 @@ from models import (
     EndSessionResponse,
     GenerateReportRequest,
     GenerateReportResponse,
+    LabAnalyticsResponse,
     PatchReportRequest,
-    GuidanceLevel,
     PostLabCheckRequest,
     PostLabCheckResponse,
+    QuestionClassification,
     QuestionRecord,
     SessionDocument,
     SessionStatus,
     StartSessionRequest,
     StartSessionResponse,
+    StudentLabSummary,
     ValidateQuestionRequest,
     ValidateQuestionResponse,
     ViolationRecord,
     ViolationSeverity,
+    ViolationType,
 )
-from policy_engine import ClassificationResult, classify_question, determine_guidance_level
+from policy_engine import ClassificationResult, classify_question
 from report_generator import generate_post_lab_report, generate_session_report
 
 # ---------------------------------------------------------------------------
@@ -63,8 +66,7 @@ class Settings(BaseSettings):
     USE_MEMORY_STORE: bool = False
     LOG_LEVEL: str = "INFO"
 
-    class Config:
-        env_file = ".env"
+    model_config = {"env_file": ".env"}
 
 
 settings = Settings()
@@ -76,7 +78,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Application lifespan
+# Rate limiter — keyed by student_id from the request body
 # ---------------------------------------------------------------------------
 
 def _key_by_student_id(request: Request) -> str:
@@ -90,6 +92,10 @@ def _key_by_student_id(request: Request) -> str:
 
 limiter = Limiter(key_func=_key_by_student_id)
 
+
+# ---------------------------------------------------------------------------
+# Application lifespan
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -121,8 +127,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AIEIC Integrity Guardian",
-    version="1.0.0",
-    description="Policy and integrity middleware for Cal Poly STEM lab AI tutoring.",
+    version="2.0.0",
+    description="Observational integrity logging for Cal Poly STEM lab AI tutoring.",
     lifespan=lifespan,
 )
 
@@ -200,7 +206,6 @@ async def start_session(
     try:
         await cosmos.create_session(doc)
     except Exception as e:
-        # Cosmos raises CosmosResourceExistsError (HTTP 409) on duplicate id
         if "409" in str(e) or "Conflict" in str(e):
             raise HTTPException(status_code=409, detail="Session already exists.")
         logger.error("Failed to create session: %s", e, exc_info=True)
@@ -267,7 +272,7 @@ async def get_session(
 
 
 # ---------------------------------------------------------------------------
-# Validate endpoint (hot path)
+# Validate endpoint (hot path) — classify and log, never block
 # ---------------------------------------------------------------------------
 
 @app.post(
@@ -296,7 +301,7 @@ async def validate_question(
     violation_count = session.get("violation_count", 0)
 
     # 3. Classify (with fail-safe fallback)
-    llm_result: Optional[ClassificationResult] = None
+    llm_result: ClassificationResult
     try:
         llm_result = await classify_question(
             question_text=body.question_text,
@@ -313,33 +318,30 @@ async def validate_question(
         logger.warning("OpenAI rate limit hit during classification.")
         raise HTTPException(status_code=429, detail="Classification service rate limited.")
     except Exception as e:
-        # Fail-safe: allow through at MODERATE to avoid blocking students on outages
         logger.error("Classifier error (fail-safe applied): %s", e, exc_info=True)
-        from models import QuestionClassification
         llm_result = ClassificationResult(
             classification=QuestionClassification.PROCEDURAL,
             confidence=0.0,
-            reasoning="Classifier unavailable — defaulting to MODERATE.",
-            recommended_guidance=GuidanceLevel.MODERATE,
-            student_facing_message="[Classifier temporarily unavailable — limited guidance in effect]",
+            reasoning="Classifier unavailable — fail-safe applied.",
+            concept_tags=[],
         )
 
-    # 4. Apply guidance matrix
-    from models import QuestionClassification
-    guidance_level, is_violation, violation_type, severity, student_message = (
-        determine_guidance_level(
-            classification=llm_result.classification,
-            question_count=question_count,
-            violation_count=violation_count,
-            llm_result=llm_result,
-        )
-    )
+    # 4. Determine if this is a violation (observational — no blocking)
+    classification = llm_result.classification
+    if classification == QuestionClassification.DIRECT_SOLUTION:
+        is_violation = True
+        violation_type: Optional[ViolationType] = ViolationType.DIRECT_SOLUTION_REQUEST
+        severity: Optional[ViolationSeverity] = ViolationSeverity.MAJOR
+    elif classification == QuestionClassification.ANSWER_FARMING:
+        is_violation = True
+        violation_type = ViolationType.ANSWER_FARMING
+        severity = ViolationSeverity.MINOR
+    else:
+        is_violation = False
+        violation_type = None
+        severity = None
 
-    # 5. Set warning flag at question 13
-    if question_count == 13 and not session.get("warning_issued", False):
-        session["warning_issued"] = True
-
-    # 6. Log violation if detected
+    # 5. Log violation if detected
     question_id = str(uuid.uuid4())
     if is_violation and violation_type is not None:
         violation_count += 1
@@ -351,12 +353,10 @@ async def validate_question(
             violation_type=violation_type,
             severity=severity or ViolationSeverity.MINOR,
             question_text=body.question_text,
-            guidance_level=guidance_level,
-            student_message_sent=student_message or "",
         )
         session.setdefault("violations", []).append(v_record.model_dump())
 
-        # 7. Escalate on 3rd violation
+        # 6. Escalation flag at 3rd violation (observational — does not block)
         if violation_count >= 3 and not session.get("escalated", False):
             session["escalated"] = True
             logger.critical(
@@ -369,42 +369,36 @@ async def validate_question(
                 violation_type.value,
             )
 
-    # 8. Append question record
+    # 7. Append question record
     q_record = QuestionRecord(
         question_id=question_id,
         sequence_number=question_count,
         text=body.question_text,
         classification=llm_result.classification,
-        guidance_level=guidance_level,
         violation=is_violation,
         violation_type=violation_type,
-        student_message_sent=student_message,
+        concept_tags=llm_result.concept_tags,
     )
     session.setdefault("questions", []).append(q_record.model_dump())
 
-    # 9. Persist session
+    # 8. Persist session
     await cosmos.upsert_session(session)
 
-    approved = guidance_level not in (GuidanceLevel.REJECTED,)
-
     logger.info(
-        "validate: student=%s q=%d guidance=%s violation=%s",
+        "validate: student=%s q=%d classification=%s violation=%s",
         body.student_id,
         question_count,
-        guidance_level.value,
+        llm_result.classification.value,
         violation_type.value if violation_type else "none",
     )
 
     return ValidateQuestionResponse(
-        approved=approved,
-        guidance_level=guidance_level,
-        student_message=student_message,
+        classification=llm_result.classification,
         violation_detected=is_violation,
         violation_type=violation_type,
         violation_count=violation_count,
         question_count=question_count,
         session_escalated=session.get("escalated", False),
-        classification=llm_result.classification,
     )
 
 
@@ -501,3 +495,149 @@ async def patch_report(
         raise HTTPException(status_code=404, detail="Report not found.")
     report["instructor_notes"] = body.instructor_notes
     return await cosmos.upsert_report(report)
+
+
+# ---------------------------------------------------------------------------
+# Analytics endpoint — faculty dashboard
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/analytics/lab/{lab_id}",
+    response_model=LabAnalyticsResponse,
+    tags=["analytics"],
+    dependencies=[Depends(verify_internal_token)],
+)
+async def get_lab_analytics(
+    lab_id: str,
+    course_id: Optional[str] = None,
+    cosmos: CosmosIntegrityClient = Depends(get_cosmos),
+) -> LabAnalyticsResponse:
+    """Aggregate integrity stats across all students for a given lab."""
+    sessions = await cosmos.get_all_sessions_for_lab(lab_id, course_id)
+
+    total_sessions = len(sessions)
+    active_sessions = sum(
+        1 for s in sessions if s.get("status") == SessionStatus.ACTIVE.value
+    )
+    closed_sessions = total_sessions - active_sessions
+
+    all_questions: list[dict] = []
+    escalated_session_count = 0
+
+    for s in sessions:
+        all_questions.extend(s.get("questions", []))
+        if s.get("escalated"):
+            escalated_session_count += 1
+
+    total_questions = len(all_questions)
+
+    # Classification distribution across all students
+    classification_distribution = {c.value: 0 for c in QuestionClassification}
+    for q in all_questions:
+        cls = q.get("classification")
+        if cls in classification_distribution:
+            classification_distribution[cls] += 1
+
+    direct_solution_attempts = classification_distribution.get(
+        QuestionClassification.DIRECT_SOLUTION.value, 0
+    )
+    answer_farming_attempts = classification_distribution.get(
+        QuestionClassification.ANSWER_FARMING.value, 0
+    )
+    avg_questions_per_student = (
+        total_questions / total_sessions if total_sessions > 0 else 0.0
+    )
+
+    # Average session duration (closed sessions only)
+    durations: list[float] = []
+    for s in sessions:
+        started = s.get("started_at")
+        ended = s.get("ended_at")
+        if started and ended:
+            try:
+                s_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                e_dt = datetime.fromisoformat(ended.replace("Z", "+00:00"))
+                durations.append((e_dt - s_dt).total_seconds() / 60.0)
+            except Exception:
+                pass
+    avg_session_duration_minutes = (
+        round(sum(durations) / len(durations), 2) if durations else None
+    )
+
+    # Concept struggle summary — all concepts, flagged if they appear in violations
+    concept_counts: dict[str, int] = {}
+    concept_from_violation: dict[str, bool] = {}
+    for q in all_questions:
+        is_viol = q.get("violation", False)
+        for tag in q.get("concept_tags", []):
+            concept_counts[tag] = concept_counts.get(tag, 0) + 1
+            if is_viol:
+                concept_from_violation[tag] = True
+            else:
+                concept_from_violation.setdefault(tag, False)
+    concept_struggle_summary = [
+        {
+            "concept": c,
+            "frequency": n,
+            "from_violations": concept_from_violation.get(c, False),
+        }
+        for c, n in sorted(concept_counts.items(), key=lambda x: -x[1])
+    ]
+
+    # Per-student breakdown
+    student_sessions: dict[str, list[dict]] = {}
+    for s in sessions:
+        sid = s.get("student_id", "unknown")
+        student_sessions.setdefault(sid, []).append(s)
+
+    per_student: list[StudentLabSummary] = []
+    for sid, s_list in student_sessions.items():
+        q_count = sum(s.get("question_count", 0) for s in s_list)
+        v_count = sum(s.get("violation_count", 0) for s in s_list)
+        any_escalated = any(s.get("escalated") for s in s_list)
+
+        breakdown: dict[str, int] = {c.value: 0 for c in QuestionClassification}
+        for s in s_list:
+            for q in s.get("questions", []):
+                cls = q.get("classification")
+                if cls in breakdown:
+                    breakdown[cls] += 1
+
+        total_for_student = sum(breakdown.values())
+        conceptual_count = breakdown.get(QuestionClassification.CONCEPTUAL.value, 0)
+
+        if v_count >= 2 or any_escalated:
+            status = "FLAGGED"
+        elif total_for_student > 0 and (conceptual_count / total_for_student) > 0.5:
+            status = "NEEDS_HELP"
+        else:
+            status = "ON_TRACK"
+
+        per_student.append(StudentLabSummary(
+            student_id=sid,
+            question_count=q_count,
+            violation_count=v_count,
+            status=status,
+            classification_breakdown=breakdown,
+        ))
+
+    return LabAnalyticsResponse(
+        lab_id=lab_id,
+        course_id=course_id,
+        session_stats={
+            "total_sessions": total_sessions,
+            "active_sessions": active_sessions,
+            "closed_sessions": closed_sessions,
+        },
+        question_stats={
+            "total_questions": total_questions,
+            "avg_questions_per_student": round(avg_questions_per_student, 2),
+            "direct_solution_attempts": direct_solution_attempts,
+            "answer_farming_attempts": answer_farming_attempts,
+            "escalated_session_count": escalated_session_count,
+        },
+        classification_distribution=classification_distribution,
+        avg_session_duration_minutes=avg_session_duration_minutes,
+        per_student=per_student,
+        concept_struggle_summary=concept_struggle_summary,
+    )

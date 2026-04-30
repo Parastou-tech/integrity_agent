@@ -87,6 +87,31 @@ class CosmosIntegrityClient:
             results.append(item)
         return results
 
+    async def get_all_sessions_for_lab(
+        self, lab_id: str, course_id: Optional[str] = None
+    ) -> list[dict]:
+        """Cross-student query: all sessions for a given lab, optionally filtered by course_id."""
+        if course_id:
+            query = (
+                "SELECT * FROM c WHERE c.lab_id = @lab_id AND c.course_id = @cid"
+            )
+            params = [
+                {"name": "@lab_id", "value": lab_id},
+                {"name": "@cid", "value": course_id},
+            ]
+        else:
+            query = "SELECT * FROM c WHERE c.lab_id = @lab_id"
+            params = [{"name": "@lab_id", "value": lab_id}]
+
+        results = []
+        async for item in self._sessions.query_items(
+            query=query,
+            parameters=params,
+            enable_cross_partition_query=True,
+        ):
+            results.append(item)
+        return results
+
     # ------------------------------------------------------------------
     # Report operations
     # ------------------------------------------------------------------

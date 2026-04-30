@@ -10,17 +10,10 @@ from pydantic import BaseModel, Field
 # Enums
 # ---------------------------------------------------------------------------
 
-class GuidanceLevel(str, Enum):
-    FULL = "FULL"
-    MODERATE = "MODERATE"
-    MINIMAL = "MINIMAL"
-    REJECTED = "REJECTED"
-
-
 class ViolationType(str, Enum):
     DIRECT_SOLUTION_REQUEST = "DIRECT_SOLUTION_REQUEST"
     ANSWER_FARMING = "ANSWER_FARMING"
-    FREQ_LIMIT_EXCEEDED = "FREQ_LIMIT_EXCEEDED"
+    FREQ_LIMIT_EXCEEDED = "FREQ_LIMIT_EXCEEDED"  # kept for backward compat
 
 
 class ViolationSeverity(str, Enum):
@@ -94,15 +87,12 @@ class ValidateQuestionRequest(BaseModel):
 
 
 class ValidateQuestionResponse(BaseModel):
-    approved: bool
-    guidance_level: GuidanceLevel
-    student_message: Optional[str] = None
+    classification: QuestionClassification
     violation_detected: bool = False
     violation_type: Optional[ViolationType] = None
     violation_count: int = 0
     question_count: int = 0
     session_escalated: bool = False
-    classification: QuestionClassification
 
 
 class GenerateReportRequest(BaseModel):
@@ -146,10 +136,9 @@ class QuestionRecord(BaseModel):
     )
     text: str
     classification: QuestionClassification
-    guidance_level: GuidanceLevel
     violation: bool
     violation_type: Optional[ViolationType] = None
-    student_message_sent: Optional[str] = None
+    concept_tags: list[str] = Field(default_factory=list)
 
 
 class ViolationRecord(BaseModel):
@@ -162,8 +151,6 @@ class ViolationRecord(BaseModel):
     violation_type: ViolationType
     severity: ViolationSeverity
     question_text: str
-    guidance_level: GuidanceLevel
-    student_message_sent: str
 
 
 class SessionDocument(BaseModel):
@@ -176,10 +163,34 @@ class SessionDocument(BaseModel):
     ended_at: Optional[str] = None
     question_count: int = 0
     violation_count: int = 0
-    warning_issued: bool = False
     escalated: bool = False
     status: SessionStatus = SessionStatus.ACTIVE
     questions: list[QuestionRecord] = Field(default_factory=list)
     violations: list[ViolationRecord] = Field(default_factory=list)
     report_generated: bool = False
     report_id: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Analytics response models (faculty dashboard)
+# ---------------------------------------------------------------------------
+
+class StudentLabSummary(BaseModel):
+    student_id: str
+    question_count: int
+    violation_count: int
+    status: str  # "ON_TRACK" | "FLAGGED" | "NEEDS_HELP"
+    classification_breakdown: dict[str, int]
+
+
+class LabAnalyticsResponse(BaseModel):
+    lab_id: str
+    course_id: Optional[str]
+    session_stats: dict          # total_sessions, active_sessions, closed_sessions
+    question_stats: dict         # total_questions, avg_questions_per_student,
+                                 # direct_solution_attempts, answer_farming_attempts,
+                                 # escalated_session_count
+    classification_distribution: dict[str, int]
+    avg_session_duration_minutes: Optional[float]
+    per_student: list[StudentLabSummary]
+    concept_struggle_summary: list[dict]  # [{concept, frequency, from_violations}]

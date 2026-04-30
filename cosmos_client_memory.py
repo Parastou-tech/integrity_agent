@@ -57,6 +57,17 @@ class MemoryIntegrityClient:
             results = [s for s in results if s.get("lab_id") == lab_id]
         return results
 
+    async def get_all_sessions_for_lab(
+        self, lab_id: str, course_id: Optional[str] = None
+    ) -> list[dict]:
+        results = [
+            s for s in self._sessions.values()
+            if s.get("lab_id") == lab_id
+        ]
+        if course_id:
+            results = [s for s in results if s.get("course_id") == course_id]
+        return results
+
     # ------------------------------------------------------------------
     # Report operations
     # ------------------------------------------------------------------
