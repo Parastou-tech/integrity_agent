@@ -30,6 +30,8 @@ from models import (
     GenerateReportRequest,
     GenerateReportResponse,
     LabAnalyticsResponse,
+    LogInteractionRequest,
+    LogInteractionResponse,
     PatchReportRequest,
     PostLabCheckRequest,
     PostLabCheckResponse,
@@ -39,6 +41,7 @@ from models import (
     SessionStatus,
     StartSessionRequest,
     StartSessionResponse,
+    StudentContextResponse,
     StudentLabSummary,
     ValidateQuestionRequest,
     ValidateQuestionResponse,
@@ -125,6 +128,9 @@ async def lifespan(app: FastAPI):
     logger.info("Integrity Guardian shut down.")
 
 
+AGENT_NAME = "integrity"
+AGENT_VERSION = "0.1.0"  # tracks the AIEIC interface contract version
+
 app = FastAPI(
     title="AIEIC Integrity Guardian",
     version="2.0.0",
@@ -171,12 +177,22 @@ def get_openai(request: Request) -> AsyncAzureOpenAI:
 
 
 # ---------------------------------------------------------------------------
-# Health endpoint (no auth)
+# Health endpoints (no auth) — match AIEIC interface contract
 # ---------------------------------------------------------------------------
+
+@app.get("/", tags=["health"])
+async def root() -> dict:
+    return {"status": "ok", "agent": AGENT_NAME, "version": AGENT_VERSION}
+
 
 @app.get("/health", tags=["health"])
 async def health_check() -> dict:
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat() + "Z"}
+    return {
+        "status": "healthy",
+        "agent": AGENT_NAME,
+        "version": AGENT_VERSION,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +394,7 @@ async def validate_question(
         violation=is_violation,
         violation_type=violation_type,
         concept_tags=llm_result.concept_tags,
+        hint_level=llm_result.hint_level,
     )
     session.setdefault("questions", []).append(q_record.model_dump())
 
@@ -399,6 +416,192 @@ async def validate_question(
         violation_count=violation_count,
         question_count=question_count,
         session_escalated=session.get("escalated", False),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Interface Contract endpoints — /integrity/* (used by the Orchestrator)
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/integrity/log",
+    response_model=LogInteractionResponse,
+    tags=["integrity"],
+    dependencies=[Depends(verify_internal_token)],
+)
+@limiter.limit("60/minute")
+async def log_interaction(
+    request: Request,
+    body: LogInteractionRequest,
+    cosmos: CosmosIntegrityClient = Depends(get_cosmos),
+    openai_client: AsyncAzureOpenAI = Depends(get_openai),
+) -> LogInteractionResponse:
+    """Fire-and-forget interaction log per the AIEIC interface contract.
+
+    Auto-creates the session document on first message so the Orchestrator
+    doesn't need to call /session/start separately. Internally classifies
+    the message and persists violations alongside the interaction.
+    """
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    session = await cosmos.get_session(body.session_id, body.student_id)
+    if session is None:
+        session = SessionDocument(
+            id=body.session_id,
+            student_id=body.student_id,
+            session_id=body.session_id,
+            lab_id=body.lab_id or "unknown",
+            course_id=body.course_id or "CSC580",
+            started_at=now_iso,
+        ).model_dump()
+
+    if session.get("status") == SessionStatus.CLOSED.value:
+        raise HTTPException(status_code=400, detail="Session is already closed.")
+
+    session["question_count"] = session.get("question_count", 0) + 1
+    question_count = session["question_count"]
+    violation_count = session.get("violation_count", 0)
+
+    try:
+        llm_result = await classify_question(
+            question_text=body.message,
+            conversation_history=[],
+            session_context={
+                "lab_id": session.get("lab_id", "unknown"),
+                "question_count": question_count,
+                "violation_count": violation_count,
+            },
+            openai_client=openai_client,
+            deployment_name=settings.AZURE_OPENAI_DEPLOYMENT_NAME,
+        )
+    except RateLimitError:
+        logger.warning("OpenAI rate limit hit during /integrity/log classification.")
+        raise HTTPException(status_code=429, detail="Classification service rate limited.")
+    except Exception as e:
+        logger.error("Classifier error (fail-safe applied): %s", e, exc_info=True)
+        llm_result = ClassificationResult(
+            classification=QuestionClassification.PROCEDURAL,
+            confidence=0.0,
+            reasoning="Classifier unavailable — fail-safe applied.",
+            concept_tags=[],
+        )
+
+    classification = llm_result.classification
+    if classification == QuestionClassification.DIRECT_SOLUTION:
+        is_violation, violation_type, severity = (
+            True, ViolationType.DIRECT_SOLUTION_REQUEST, ViolationSeverity.MAJOR,
+        )
+    elif classification == QuestionClassification.ANSWER_FARMING:
+        is_violation, violation_type, severity = (
+            True, ViolationType.ANSWER_FARMING, ViolationSeverity.MINOR,
+        )
+    else:
+        is_violation, violation_type, severity = False, None, None
+
+    question_id = str(uuid.uuid4())
+    if is_violation and violation_type is not None:
+        violation_count += 1
+        session["violation_count"] = violation_count
+        v_record = ViolationRecord(
+            question_id=question_id,
+            sequence_number=question_count,
+            violation_type=violation_type,
+            severity=severity or ViolationSeverity.MINOR,
+            question_text=body.message,
+        )
+        session.setdefault("violations", []).append(v_record.model_dump())
+        if violation_count >= 3 and not session.get("escalated", False):
+            session["escalated"] = True
+            logger.critical(
+                "INTEGRITY ESCALATION: student=%s session=%s lab=%s "
+                "violation_count=%d last_violation_type=%s",
+                body.student_id, body.session_id, session.get("lab_id"),
+                violation_count, violation_type.value,
+            )
+
+    q_record = QuestionRecord(
+        question_id=question_id,
+        sequence_number=question_count,
+        text=body.message,
+        classification=llm_result.classification,
+        violation=is_violation,
+        violation_type=violation_type,
+        concept_tags=llm_result.concept_tags,
+        hint_level=llm_result.hint_level,
+        response_time_ms=body.response_time_ms,
+    )
+    session.setdefault("questions", []).append(q_record.model_dump())
+    await cosmos.upsert_session(session)
+
+    logger.info(
+        "/integrity/log: student=%s q=%d classification=%s hint=%d violation=%s",
+        body.student_id, question_count, classification.value,
+        int(llm_result.hint_level),
+        violation_type.value if violation_type else "none",
+    )
+    return LogInteractionResponse(status="ok", interaction_id=question_id)
+
+
+@app.get(
+    "/integrity/context/{student_id}",
+    response_model=StudentContextResponse,
+    tags=["integrity"],
+    dependencies=[Depends(verify_internal_token)],
+)
+async def get_student_context(
+    student_id: str,
+    cosmos: CosmosIntegrityClient = Depends(get_cosmos),
+) -> StudentContextResponse:
+    """Aggregated learning profile per the AIEIC interface contract."""
+    sessions = await cosmos.get_all_sessions_for_student(student_id)
+
+    all_questions: list[dict] = []
+    for s in sessions:
+        all_questions.extend(s.get("questions", []))
+
+    total_questions = len(all_questions)
+    sessions_count = len(sessions)
+
+    type_dist: dict[str, int] = {c.value: 0 for c in QuestionClassification}
+    for q in all_questions:
+        cls = q.get("classification")
+        if cls in type_dist:
+            type_dist[cls] += 1
+
+    hint_levels = [
+        int(q["hint_level"]) for q in all_questions
+        if q.get("hint_level") is not None
+    ]
+    avg_hint_level = (sum(hint_levels) / len(hint_levels)) if hint_levels else 0.0
+
+    avg_questions_per_session = (
+        total_questions / sessions_count if sessions_count else 0.0
+    )
+
+    session_help_frequency = {
+        s.get("session_id", s.get("id", "unknown")): s.get("question_count", 0)
+        for s in sessions
+    }
+
+    if type_dist and total_questions:
+        primary_type = max(type_dist, key=lambda k: type_dist[k]).lower()
+    else:
+        primary_type = "n/a"
+    summary = (
+        f"Student has asked {total_questions} question"
+        f"{'s' if total_questions != 1 else ''} across {sessions_count} session"
+        f"{'s' if sessions_count != 1 else ''}. "
+        f"Primary focus: {primary_type}. "
+        f"Average hint level: {avg_hint_level:.1f}."
+    )
+
+    return StudentContextResponse(
+        total_questions=total_questions,
+        question_type_distribution=type_dist,
+        avg_hint_level=avg_hint_level,
+        sessions_count=sessions_count,
+        avg_questions_per_session=round(avg_questions_per_session, 2),
+        session_help_frequency=session_help_frequency,
+        summary=summary,
     )
 
 

@@ -35,16 +35,27 @@ def _make_openai_mock():
     return client
 
 
+## ---------------------------------------------------------------------------
+# GET / and GET /health — AIEIC interface contract shape
 # ---------------------------------------------------------------------------
-# GET /health
-# ---------------------------------------------------------------------------
+
+def test_root_endpoint():
+    with TestClient(app) as c:
+        r = c.get("/")
+        assert r.status_code == 200
+        body = r.json()
+        assert body == {"status": "ok", "agent": "integrity", "version": "0.1.0"}
+
 
 def test_health_check():
     with TestClient(app) as c:
         r = c.get("/health")
         assert r.status_code == 200
-        assert r.json()["status"] == "ok"
-        assert "timestamp" in r.json()
+        body = r.json()
+        assert body["status"] == "healthy"
+        assert body["agent"] == "integrity"
+        assert body["version"] == "0.1.0"
+        assert "timestamp" in body
 
 
 def test_health_requires_no_auth():
@@ -282,4 +293,146 @@ def test_lab_analytics_course_id_filter():
 def test_lab_analytics_requires_auth():
     with TestClient(app) as c:
         r = c.get("/analytics/lab/lab01", headers={"X-Internal-Token": "wrong"})
+        assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# POST /integrity/log — AIEIC interface contract endpoint
+# ---------------------------------------------------------------------------
+
+def test_integrity_log_auto_creates_session():
+    """First log call for an unknown session creates the session document."""
+    with TestClient(app) as c:
+        app.state.openai_client = _make_openai_mock()
+        session_id = str(uuid.uuid4())
+
+        r = c.post("/integrity/log", json={
+            "student_id": "alex_m",
+            "session_id": session_id,
+            "message": "What does impedance matching mean?",
+            "response_time_ms": 1234,
+            "lab_id": "lab4",
+            "course_id": "CSC580",
+        }, headers=HEADERS)
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "ok"
+        assert isinstance(body["interaction_id"], str)
+        # Session is now retrievable
+        s = c.get(f"/session/{session_id}", params={"student_id": "alex_m"}, headers=HEADERS)
+        assert s.status_code == 200
+        assert s.json()["question_count"] == 1
+        assert s.json()["lab_id"] == "lab4"
+
+
+def test_integrity_log_appends_to_existing_session():
+    with TestClient(app) as c:
+        app.state.openai_client = _make_openai_mock()
+        session_id = str(uuid.uuid4())
+        c.post("/session/start", json={
+            "student_id": "alex_m", "session_id": session_id,
+            "lab_id": "lab4", "course_id": "CSC580",
+        }, headers=HEADERS)
+
+        for msg in ["q1", "q2", "q3"]:
+            r = c.post("/integrity/log", json={
+                "student_id": "alex_m",
+                "session_id": session_id,
+                "message": msg,
+            }, headers=HEADERS)
+            assert r.status_code == 200
+
+        s = c.get(f"/session/{session_id}", params={"student_id": "alex_m"}, headers=HEADERS)
+        assert s.json()["question_count"] == 3
+        assert len(s.json()["questions"]) == 3
+        # hint_level was persisted on each question
+        for q in s.json()["questions"]:
+            assert q["hint_level"] in (1, 2, 3)
+
+
+def test_integrity_log_rejects_closed_session():
+    with TestClient(app) as c:
+        app.state.openai_client = _make_openai_mock()
+        session_id = str(uuid.uuid4())
+        c.post("/session/start", json={
+            "student_id": "alex_m", "session_id": session_id,
+            "lab_id": "lab4", "course_id": "CSC580",
+        }, headers=HEADERS)
+        c.post("/session/end", json={
+            "student_id": "alex_m", "session_id": session_id,
+        }, headers=HEADERS)
+
+        r = c.post("/integrity/log", json={
+            "student_id": "alex_m", "session_id": session_id, "message": "hi",
+        }, headers=HEADERS)
+        assert r.status_code == 400
+
+
+def test_integrity_log_requires_auth():
+    with TestClient(app) as c:
+        r = c.post("/integrity/log", json={
+            "student_id": "alex_m",
+            "session_id": str(uuid.uuid4()),
+            "message": "hi",
+        }, headers={"X-Internal-Token": "wrong"})
+        assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# GET /integrity/context/{student_id} — AIEIC interface contract endpoint
+# ---------------------------------------------------------------------------
+
+def test_integrity_context_empty_student():
+    with TestClient(app) as c:
+        r = c.get("/integrity/context/no-such-student", headers=HEADERS)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["total_questions"] == 0
+        assert body["sessions_count"] == 0
+        assert body["avg_hint_level"] == 0.0
+        assert body["avg_questions_per_session"] == 0.0
+        assert body["session_help_frequency"] == {}
+        # All seven contract fields present
+        for field in [
+            "total_questions", "question_type_distribution", "avg_hint_level",
+            "sessions_count", "avg_questions_per_session", "session_help_frequency",
+            "summary",
+        ]:
+            assert field in body
+
+
+def test_integrity_context_aggregates_across_sessions():
+    with TestClient(app) as c:
+        app.state.openai_client = _make_openai_mock()
+        student_id = f"alex-{uuid.uuid4()}"
+
+        # Two sessions, 3 messages in the first, 2 in the second
+        sid1, sid2 = str(uuid.uuid4()), str(uuid.uuid4())
+        for sid, count in [(sid1, 3), (sid2, 2)]:
+            for i in range(count):
+                c.post("/integrity/log", json={
+                    "student_id": student_id,
+                    "session_id": sid,
+                    "message": f"question {i}",
+                    "lab_id": "lab4",
+                }, headers=HEADERS)
+
+        r = c.get(f"/integrity/context/{student_id}", headers=HEADERS)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["total_questions"] == 5
+        assert body["sessions_count"] == 2
+        assert body["avg_questions_per_session"] == 2.5
+        # The mock always returns CONCEPTUAL → hint_level falls back to 1 (NUDGE)
+        assert body["question_type_distribution"]["CONCEPTUAL"] == 5
+        assert body["avg_hint_level"] == 1.0
+        assert body["session_help_frequency"][sid1] == 3
+        assert body["session_help_frequency"][sid2] == 2
+        assert "5 questions across 2 sessions" in body["summary"]
+
+
+def test_integrity_context_requires_auth():
+    with TestClient(app) as c:
+        r = c.get("/integrity/context/alex_m", headers={"X-Internal-Token": "wrong"})
         assert r.status_code == 403

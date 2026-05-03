@@ -68,8 +68,10 @@ Everything else is pre-set for demo mode (`USE_MEMORY_STORE=true`, `INTERNAL_API
 
 **5. Start the server** (Terminal 1)
 ```bash
-uvicorn app:app --reload
+uvicorn app:app --reload --port 8001
 ```
+
+The service listens on port **8001** to match the AIEIC interface contract.
 
 **6. Run the demo script** (Terminal 2)
 ```bash
@@ -128,12 +130,59 @@ All endpoints except `/health` require the header:
 X-Internal-Token: <INTERNAL_API_TOKEN>
 ```
 
-### `GET /health`
-Liveness probe. No auth required.
+### `GET /` and `GET /health`
+Liveness probes per the AIEIC interface contract. No auth required.
+
+```json
+GET /       → { "status": "ok",      "agent": "integrity", "version": "0.1.0" }
+GET /health → { "status": "healthy", "agent": "integrity", "version": "0.1.0",
+                "timestamp": "2026-04-13T10:00:00Z" }
+```
+
+---
+
+### `POST /integrity/log` ★ Contract endpoint
+Fire-and-forget interaction log called by the Orchestrator after every student message.
+Auto-creates the session document if it does not yet exist, then classifies the message
+internally (running the same violation/escalation logic as `/validate`).
+
+**Request**
+```json
+{
+  "student_id": "alex_m",
+  "session_id": "550e8400-...",
+  "message": "How do I insert at position 3?",
+  "response_time_ms": 1234,
+  "lab_id": "lab4",
+  "course_id": "CSC580"
+}
+```
+`response_time_ms`, `lab_id`, and `course_id` are optional.
 
 **Response**
 ```json
-{ "status": "ok", "timestamp": "2026-04-13T10:00:00Z" }
+{ "status": "ok", "interaction_id": "uuid" }
+```
+
+---
+
+### `GET /integrity/context/{student_id}` ★ Contract endpoint
+Returns the student's aggregated learning profile across all sessions.
+
+**Response**
+```json
+{
+  "total_questions": 12,
+  "question_type_distribution": {
+    "CONCEPTUAL": 3, "PROCEDURAL": 7, "CLARIFICATION": 2,
+    "DIRECT_SOLUTION": 0, "ANSWER_FARMING": 0
+  },
+  "avg_hint_level": 1.8,
+  "sessions_count": 3,
+  "avg_questions_per_session": 4.0,
+  "session_help_frequency": { "sess1": 5, "sess2": 4, "sess3": 3 },
+  "summary": "Student has asked 12 questions across 3 sessions. Primary focus: procedural. Average hint level: 1.8."
+}
 ```
 
 ---
