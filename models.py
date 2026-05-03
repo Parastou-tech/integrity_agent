@@ -29,6 +29,12 @@ class QuestionClassification(str, Enum):
     ANSWER_FARMING = "ANSWER_FARMING"    # incremental pattern assembling full solution
 
 
+class HintLevel(int, Enum):
+    NUDGE = 1          # subtle hint
+    EXPLAIN = 2        # explain the error / concept
+    POINT_TO_DOCS = 3  # point to docs / spec
+
+
 class SessionStatus(str, Enum):
     ACTIVE = "active"
     CLOSED = "closed"
@@ -125,6 +131,35 @@ class PostLabCheckResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Interface Contract — /integrity/* endpoints (matches director's spec)
+# ---------------------------------------------------------------------------
+
+class LogInteractionRequest(BaseModel):
+    student_id: str
+    session_id: str
+    message: str = Field(..., min_length=1, max_length=4000)
+    response_time_ms: Optional[int] = None
+    # Optional extension fields — orchestrator may include them.
+    lab_id: Optional[str] = None
+    course_id: Optional[str] = None
+
+
+class LogInteractionResponse(BaseModel):
+    status: str = "ok"
+    interaction_id: str
+
+
+class StudentContextResponse(BaseModel):
+    total_questions: int
+    question_type_distribution: dict[str, int]
+    avg_hint_level: float
+    sessions_count: int
+    avg_questions_per_session: float
+    session_help_frequency: dict[str, int]
+    summary: str
+
+
+# ---------------------------------------------------------------------------
 # Cosmos DB document models
 # ---------------------------------------------------------------------------
 
@@ -139,6 +174,8 @@ class QuestionRecord(BaseModel):
     violation: bool
     violation_type: Optional[ViolationType] = None
     concept_tags: list[str] = Field(default_factory=list)
+    hint_level: Optional[HintLevel] = None
+    response_time_ms: Optional[int] = None
 
 
 class ViolationRecord(BaseModel):

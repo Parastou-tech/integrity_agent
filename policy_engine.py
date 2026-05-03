@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 from openai import AsyncAzureOpenAI
 
-from models import QuestionClassification
+from models import HintLevel, QuestionClassification
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +82,24 @@ ANSWER_FARMING
 5. When in doubt between CONCEPTUAL/PROCEDURAL and DIRECT_SOLUTION/ANSWER_FARMING,
    prefer the non-violation classification unless the evidence is clear.
 
+## Hint Level
+
+In addition to the classification, decide what kind of tutoring response would be most
+appropriate for this question. This guides the Lab Companion toward the right response style:
+
+  1 = NUDGE          subtle hint; the student is on the right track and just needs a small
+                     prompt or a question back. Use for CONCEPTUAL questions where the
+                     student is exploring ideas.
+  2 = EXPLAIN        explain the error, concept, or procedure step-by-step. Use for
+                     PROCEDURAL or debugging-style questions where the student needs a
+                     worked-through walkthrough.
+  3 = POINT_TO_DOCS  direct the student to the lab spec, course notes, or a reference.
+                     Use for CLARIFICATION questions about lab instructions, terminology,
+                     or where to look something up.
+
+For DIRECT_SOLUTION or ANSWER_FARMING, default hint_level to 1 (the appropriate response
+is a redirective nudge rather than the answer).
+
 ## Output Format
 
 Respond with ONLY valid JSON. No markdown, no explanation outside the JSON.
@@ -90,7 +108,8 @@ Respond with ONLY valid JSON. No markdown, no explanation outside the JSON.
   "classification": "CONCEPTUAL|PROCEDURAL|CLARIFICATION|DIRECT_SOLUTION|ANSWER_FARMING",
   "confidence": <float 0.0-1.0>,
   "reasoning": "<1-2 sentence explanation of the classification>",
-  "concept_tags": ["<topic 1>", "<topic 2>"]
+  "concept_tags": ["<topic 1>", "<topic 2>"],
+  "hint_level": 1 | 2 | 3
 }
 
 concept_tags: A list of 1-3 short technical topic labels identifying the concept(s) the
@@ -110,6 +129,7 @@ class ClassificationResult:
     confidence: float
     reasoning: str
     concept_tags: list[str] = field(default_factory=list)
+    hint_level: HintLevel = HintLevel.EXPLAIN
 
 
 # ---------------------------------------------------------------------------
@@ -162,9 +182,29 @@ async def classify_question(
     raw = response.choices[0].message.content
     parsed = json.loads(raw)
 
+    classification = QuestionClassification(parsed["classification"])
+    raw_hint = parsed.get("hint_level")
+    if raw_hint is None:
+        hint_level = _default_hint_level(classification)
+    else:
+        try:
+            hint_level = HintLevel(int(raw_hint))
+        except (ValueError, TypeError):
+            hint_level = _default_hint_level(classification)
+
     return ClassificationResult(
-        classification=QuestionClassification(parsed["classification"]),
+        classification=classification,
         confidence=float(parsed.get("confidence", 1.0)),
         reasoning=parsed.get("reasoning", ""),
         concept_tags=parsed.get("concept_tags", []),
+        hint_level=hint_level,
     )
+
+
+def _default_hint_level(classification: QuestionClassification) -> HintLevel:
+    """Fallback mapping when the LLM doesn't return a parseable hint_level."""
+    if classification == QuestionClassification.CONCEPTUAL:
+        return HintLevel.NUDGE
+    if classification == QuestionClassification.CLARIFICATION:
+        return HintLevel.POINT_TO_DOCS
+    return HintLevel.EXPLAIN

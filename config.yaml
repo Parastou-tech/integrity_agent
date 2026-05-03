@@ -6,7 +6,7 @@ properties:
     ingress:
       allowInsecure: false
       external: false           # Internal only — not publicly exposed
-      targetPort: 8000
+      targetPort: 8001
       transport: Auto
     secrets:
     - name: cosmos-key
